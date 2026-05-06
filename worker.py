@@ -1,9 +1,23 @@
 import time
 import json
 
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError
+)
+
+from app.core.logger import logger
 from app.core.redis_client import redis_client
 from app.database import SessionLocal
+
+# =====================================================
+# 🔥 IMPORT ALL MODELS
+# =====================================================
+
+from app.models.user import User
+from app.models.profile import MedicalProfile
 from app.models.emergency import Emergency
+
 from app.services.triage_service import analyze_symptoms
 
 QUEUE = "emergency_queue"
@@ -11,73 +25,181 @@ PROCESSING_QUEUE = "emergency_processing"
 FAILED_QUEUE = "emergency_failed"
 
 MAX_RETRIES = 3
+JOB_TIMEOUT = 30
 
+
+# =====================================================
+# 🔥 PROCESS EMERGENCY
+# =====================================================
 
 def process_emergency(emergency_id):
+
     db = SessionLocal()
 
-    try:
-        print(f"[INFO] Processing {emergency_id}")
+    start_time = time.time()
 
+    try:
+
+        logger.info(
+            f"event=processing_started "
+            f"emergency_id={emergency_id}"
+        )
+
+        # ==========================================
         # 🔥 FETCH EMERGENCY
+        # ==========================================
+
         emergency = db.query(Emergency).filter(
             Emergency.id == emergency_id
         ).first()
 
         if not emergency:
-            print(f"[ERROR] Emergency not found: {emergency_id}")
+
+            logger.error(
+                f"event=emergency_not_found "
+                f"emergency_id={emergency_id}"
+            )
+
             return False
 
-        # 🔥 ATOMIC STATE TRANSITION
-        updated = db.query(Emergency).filter(
-            Emergency.id == emergency_id,
-            Emergency.status == "CREATED"
-        ).update({"status": "PROCESSING"})
+        # ==========================================
+        # 🔥 SAFE STATE CHECK
+        # ==========================================
 
-        db.commit()
+        if emergency.status != "CREATED":
 
-        if not updated:
-            print(f"[INFO] Already processed: {emergency_id}")
+            logger.warning(
+                f"event=already_processed "
+                f"emergency_id={emergency_id}"
+            )
+
             return True
 
-        # =====================================================
-        # 🔥 GENAI TRIAGE
-        # =====================================================
+        # ==========================================
+        # 🔥 UPDATE STATUS
+        # ==========================================
 
-        triage = analyze_symptoms(emergency.symptoms)
+        emergency.status = "PROCESSING"
 
-        print("\n================ TRIAGE RESULT ================")
-        print(triage)
-        print("================================================\n")
-
-        # 🔥 simulate remaining work
-        time.sleep(5)
-
-        # 🔥 FINAL STATE
-        db.query(Emergency).filter(
-            Emergency.id == emergency_id
-        ).update({"status": "MATCHED"})
-
+        db.add(emergency)
         db.commit()
 
-        print(f"[SUCCESS] Completed {emergency_id}")
+        # ==========================================
+        # 🔥 GENAI TRIAGE
+        # ==========================================
+
+        triage = analyze_symptoms(
+            emergency.symptoms
+        )
+
+        # ==========================================
+        # 🔥 STORE TRIAGE INTELLIGENCE
+        # ==========================================
+
+        emergency.severity = triage.severity
+        emergency.confidence = triage.confidence
+        emergency.requires_icu = triage.requires_icu
+        emergency.rationale = triage.rationale
+        emergency.triage_source = triage.source
+
+        emergency.specializations = json.dumps(
+            triage.specializations
+        )
+
+        db.add(emergency)
+        db.commit()
+
+        logger.info(
+            f"event=triage_completed "
+            f"emergency_id={emergency_id} "
+            f"severity={triage.severity} "
+            f"source={triage.source} "
+            f"confidence={triage.confidence}"
+        )
+
+        # ==========================================
+        # 🔥 SIMULATE REMAINING WORK
+        # ==========================================
+
+        time.sleep(5)
+
+        # ==========================================
+        # 🔥 FINAL STATUS
+        # ==========================================
+
+        emergency.status = "MATCHED"
+
+        db.add(emergency)
+        db.commit()
+
+        processing_time = round(
+            time.time() - start_time,
+            2
+        )
+
+        logger.info(
+            f"event=processing_completed "
+            f"emergency_id={emergency_id} "
+            f"processing_time={processing_time}s"
+        )
 
         return True
 
     except Exception as e:
-        print(f"[ERROR] Failed {emergency_id}: {str(e)}")
+
+        logger.error(
+            f"event=processing_failed "
+            f"emergency_id={emergency_id} "
+            f"error={str(e)}"
+        )
+
         return False
 
     finally:
+
         db.close()
 
 
+# =====================================================
+# 🔥 PROCESS WITH TIMEOUT
+# =====================================================
+
+def process_with_timeout(emergency_id):
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+
+        future = executor.submit(
+            process_emergency,
+            emergency_id
+        )
+
+        try:
+
+            return future.result(
+                timeout=JOB_TIMEOUT
+            )
+
+        except TimeoutError:
+
+            logger.error(
+                f"event=job_timeout "
+                f"emergency_id={emergency_id} "
+                f"timeout={JOB_TIMEOUT}s"
+            )
+
+            return False
+
+
+# =====================================================
+# 🔥 WORKER LOOP
+# =====================================================
+
 def worker():
-    print("🚀 Worker started...")
+
+    logger.info("event=worker_started")
 
     while True:
 
-        # 🔥 move safely to processing queue
         data = redis_client.brpoplpush(
             QUEUE,
             PROCESSING_QUEUE,
@@ -86,30 +208,41 @@ def worker():
 
         if not data:
             continue
-        print("[RAW REDIS DATA]", data)
+
+        logger.info(
+            f"event=job_received "
+            f"raw_data={data}"
+        )
+
         task = json.loads(data)
 
         emergency_id = task["emergency_id"]
+
         retries = task.get("retries", 0)
 
-        success = process_emergency(emergency_id)
+        success = process_with_timeout(
+            emergency_id
+        )
 
-        # 🔥 always remove from processing queue
-        redis_client.lrem(PROCESSING_QUEUE, 1, data)
+        redis_client.lrem(
+            PROCESSING_QUEUE,
+            1,
+            data
+        )
 
         if success:
             continue
 
-        # =====================================================
-        # 🔥 FAILURE HANDLING
-        # =====================================================
-
         retries += 1
+
         task["retries"] = retries
 
         if retries >= MAX_RETRIES:
 
-            print(f"[DLQ] Moving to failed queue: {emergency_id}")
+            logger.error(
+                f"event=job_moved_to_dlq "
+                f"emergency_id={emergency_id}"
+            )
 
             redis_client.rpush(
                 FAILED_QUEUE,
@@ -118,16 +251,26 @@ def worker():
 
             db = SessionLocal()
 
-            db.query(Emergency).filter(
+            emergency = db.query(Emergency).filter(
                 Emergency.id == emergency_id
-            ).update({"status": "FAILED"})
+            ).first()
 
-            db.commit()
+            if emergency:
+
+                emergency.status = "FAILED"
+
+                db.add(emergency)
+                db.commit()
+
             db.close()
 
         else:
 
-            print(f"[RETRY] Retrying {emergency_id} (attempt {retries})")
+            logger.warning(
+                f"event=job_retry "
+                f"emergency_id={emergency_id} "
+                f"attempt={retries}"
+            )
 
             redis_client.rpush(
                 QUEUE,
