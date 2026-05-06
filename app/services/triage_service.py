@@ -1,12 +1,34 @@
 import json
+import pybreaker
 
 from groq import Groq
 
 from app.core.config import GROQ_API_KEY
 from app.schemas.triage import TriageResult
-from app.services.symptom_service import map_symptoms_to_specialization
+from app.services.symptom_service import (
+    map_symptoms_to_specialization
+)
 
-client = Groq(api_key=GROQ_API_KEY)
+# =====================================================
+# 🔥 GROQ CLIENT
+# =====================================================
+
+client = Groq(
+    api_key=GROQ_API_KEY
+)
+
+# =====================================================
+# 🔥 CIRCUIT BREAKER
+# =====================================================
+
+breaker = pybreaker.CircuitBreaker(
+    fail_max=5,
+    reset_timeout=30
+)
+
+# =====================================================
+# 🔥 SYSTEM PROMPT
+# =====================================================
 
 SYSTEM_PROMPT = """
 You are a medical emergency triage assistant.
@@ -23,9 +45,17 @@ Schema:
 }
 """
 
+# =====================================================
+# 🔥 FALLBACK TRIAGE
+# =====================================================
 
 def fallback_triage(symptoms: str):
-    specializations = map_symptoms_to_specialization(symptoms)
+
+    specializations = (
+        map_symptoms_to_specialization(
+            symptoms
+        )
+    )
 
     return TriageResult(
         specializations=specializations,
@@ -36,29 +66,58 @@ def fallback_triage(symptoms: str):
         source="fallback"
     )
 
+# =====================================================
+# 🔥 LLM CALL
+# =====================================================
+
+@breaker
+def call_llm(symptoms: str):
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": symptoms
+            }
+        ],
+        temperature=0
+    )
+
+    return response
+
+# =====================================================
+# 🔥 ANALYZE SYMPTOMS
+# =====================================================
 
 def analyze_symptoms(symptoms: str):
+
     try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT
-                },
-                {
-                    "role": "user",
-                    "content": symptoms
-                }
-            ],
-            temperature=0
+
+        response = call_llm(
+            symptoms
         )
 
-        raw_output = response.choices[0].message.content
+        raw_output = (
+            response
+            .choices[0]
+            .message
+            .content
+        )
 
-        print("[RAW LLM OUTPUT]", raw_output)
+        print(
+            "[RAW LLM OUTPUT]",
+            raw_output
+        )
 
-        # cleanup
+        # ==========================================
+        # 🔥 CLEANUP
+        # ==========================================
+
         raw_output = (
             raw_output
             .replace("```json", "")
@@ -66,7 +125,17 @@ def analyze_symptoms(symptoms: str):
             .strip()
         )
 
-        data = json.loads(raw_output)
+        # ==========================================
+        # 🔥 PARSE JSON
+        # ==========================================
+
+        data = json.loads(
+            raw_output
+        )
+
+        # ==========================================
+        # 🔥 STRUCTURED RESULT
+        # ==========================================
 
         result = TriageResult(
             specializations=data["specializations"],
@@ -79,7 +148,31 @@ def analyze_symptoms(symptoms: str):
 
         return result
 
-    except Exception as e:
-        print("[LLM ERROR]", str(e))
+    # ==============================================
+    # 🔥 CIRCUIT BREAKER OPEN
+    # ==============================================
 
-        return fallback_triage(symptoms)
+    except pybreaker.CircuitBreakerError:
+
+        print(
+            "[CIRCUIT OPEN] Groq temporarily disabled"
+        )
+
+        return fallback_triage(
+            symptoms
+        )
+
+    # ==============================================
+    # 🔥 GENERAL FAILURE
+    # ==============================================
+
+    except Exception as e:
+
+        print(
+            "[LLM ERROR]",
+            str(e)
+        )
+
+        return fallback_triage(
+            symptoms
+        )
