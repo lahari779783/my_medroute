@@ -10,15 +10,14 @@ from app.core.logger import logger
 from app.core.redis_client import redis_client
 from app.database import SessionLocal
 
-# =====================================================
-# 🔥 IMPORT ALL MODELS
-# =====================================================
-
-from app.models.user import User
-from app.models.profile import MedicalProfile
 from app.models.emergency import Emergency
 
 from app.services.triage_service import analyze_symptoms
+from app.services.hospital_service import get_nearby_hospitals
+from app.services.ranking_service import rank_hospitals
+
+from app.models.user import User
+from app.models.profile import MedicalProfile
 
 QUEUE = "emergency_queue"
 PROCESSING_QUEUE = "emergency_processing"
@@ -82,6 +81,7 @@ def process_emergency(emergency_id):
         emergency.status = "PROCESSING"
 
         db.add(emergency)
+
         db.commit()
 
         # ==========================================
@@ -97,9 +97,13 @@ def process_emergency(emergency_id):
         # ==========================================
 
         emergency.severity = triage.severity
+
         emergency.confidence = triage.confidence
+
         emergency.requires_icu = triage.requires_icu
+
         emergency.rationale = triage.rationale
+
         emergency.triage_source = triage.source
 
         emergency.specializations = json.dumps(
@@ -107,15 +111,57 @@ def process_emergency(emergency_id):
         )
 
         db.add(emergency)
+
         db.commit()
 
         logger.info(
             f"event=triage_completed "
             f"emergency_id={emergency_id} "
             f"severity={triage.severity} "
-            f"source={triage.source} "
-            f"confidence={triage.confidence}"
+            f"source={triage.source}"
         )
+
+        # ==========================================
+        # 🔥 FETCH NEARBY HOSPITALS
+        # ==========================================
+
+        hospitals = get_nearby_hospitals(
+            latitude=emergency.latitude,
+            longitude=emergency.longitude
+        )
+
+        logger.info(
+            f"event=hospitals_fetched "
+            f"emergency_id={emergency_id} "
+            f"count={len(hospitals)}"
+        )
+
+        # ==========================================
+        # 🔥 RANK HOSPITALS
+        # ==========================================
+
+        ranked_hospitals = rank_hospitals(
+            hospitals,
+            emergency
+        )
+
+        logger.info(
+            f"event=hospital_ranking_completed "
+            f"emergency_id={emergency_id} "
+            f"count={len(ranked_hospitals)}"
+        )
+
+        # ==========================================
+        # 🔥 STORE RANKED HOSPITALS
+        # ==========================================
+
+        emergency.matched_hospitals = json.dumps(
+            ranked_hospitals
+        )
+
+        db.add(emergency)
+
+        db.commit()
 
         # ==========================================
         # 🔥 SIMULATE REMAINING WORK
@@ -130,6 +176,7 @@ def process_emergency(emergency_id):
         emergency.status = "MATCHED"
 
         db.add(emergency)
+
         db.commit()
 
         processing_time = round(
@@ -183,8 +230,7 @@ def process_with_timeout(emergency_id):
 
             logger.error(
                 f"event=job_timeout "
-                f"emergency_id={emergency_id} "
-                f"timeout={JOB_TIMEOUT}s"
+                f"emergency_id={emergency_id}"
             )
 
             return False
@@ -210,8 +256,7 @@ def worker():
             continue
 
         logger.info(
-            f"event=job_received "
-            f"raw_data={data}"
+            f"event=job_received raw_data={data}"
         )
 
         task = json.loads(data)
@@ -260,6 +305,7 @@ def worker():
                 emergency.status = "FAILED"
 
                 db.add(emergency)
+
                 db.commit()
 
             db.close()

@@ -41,6 +41,25 @@ class Emergency(Base):
     )
 
     # =====================================================
+    # 🔥 LOCATION INTELLIGENCE
+    # =====================================================
+
+    latitude = Column(
+        Float,
+        nullable=True
+    )
+
+    longitude = Column(
+        Float,
+        nullable=True
+    )
+
+    address = Column(
+        Text,
+        nullable=True
+    )
+
+    # =====================================================
     # 🔥 TRIAGE INTELLIGENCE
     # =====================================================
 
@@ -70,6 +89,11 @@ class Emergency(Base):
     )
 
     specializations = Column(
+        Text,
+        nullable=True
+    )
+
+    matched_hospitals = Column(
         Text,
         nullable=True
     )
